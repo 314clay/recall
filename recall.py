@@ -65,50 +65,30 @@ from textual.widgets import (
 # Project mapping (ported from claude-sessions)
 # ─────────────────────────────────────────────────────────────────────
 
-PROJECT_RULES: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"tinder[-_]?clone|/tinder", re.I), "tinder"),
-    (re.compile(r"lingoswipe|lingo[-_]?swipe", re.I), "lingo"),
-    (re.compile(r"dashboard[-_]?native", re.I), "dash"),
-    (re.compile(r"/p/connect\b"), "connect"),
-    (re.compile(r"clawdbot[-_]?chat|/clawdbot", re.I), "clawdbot"),
-    (re.compile(r"cloudbot[-_]?ios", re.I), "cloudbot"),
-    (re.compile(r"ig[-_]?dm[-_]?scraper", re.I), "ig-dm"),
-    (re.compile(r"lingo[-_]?watch", re.I), "lingo-watch"),
-    (re.compile(r"/gt/mayor\b|/mayor\b", re.I), "mayor"),
-    (re.compile(r"/gt/deacon\b|/deacon\b", re.I), "deacon"),
-    (re.compile(r"/gt/todo[-_]?system\b", re.I), "todo-sys"),
-    (re.compile(r"clays[-_]general[-_]workspace|/gt/general\b", re.I), "general"),
-    (re.compile(r"recall\b", re.I), "recall"),
-    (re.compile(r"\bdeck\b", re.I), "deck"),
-    (re.compile(r"wikigraph|wikitree", re.I), "wikigraph"),
-    (re.compile(r"openclaw", re.I), "openclaw"),
-    (re.compile(r"grove\b", re.I), "grove"),
-    (re.compile(r"sheetsadder", re.I), "sheetsadder"),
-]
+# Project rules: map cwd patterns to short project names.
+# Customize by creating ~/.config/recall/projects.json with entries like:
+#   { "rules": [{"pattern": "my-app", "name": "app"}],
+#     "colors": {"app": "#ff5555"} }
+PROJECT_RULES: list[tuple[re.Pattern, str]] = []
+PROJECT_COLORS: dict[str, str] = {}
 
-PROJECT_COLORS: dict[str, str] = {
-    "tinder": "#ff5555",
-    "lingo": "#55ff55",
-    "dash": "#55ffff",
-    "connect": "#ffff55",
-    "clawdbot": "#ff55ff",
-    "cloudbot": "#dd55dd",
-    "ig-dm": "#ff8800",
-    "lingo-watch": "#00aa00",
-    "mayor": "#4488ff",
-    "deacon": "#ffcc00",
-    "todo-sys": "#aa77ff",
-    "general": "#00cccc",
-    "recall": "#88ccff",
-    "deck": "#ff9944",
-    "wikigraph": "#77dd77",
-    "openclaw": "#ff6688",
-    "grove": "#44bb44",
-    "sheetsadder": "#ddaa55",
-    "w": "#888888",
-    "p": "#888888",
-    "gt": "#888888",
-}
+def _load_project_config() -> None:
+    """Load project rules from ~/.config/recall/projects.json if it exists."""
+    config_path = os.path.expanduser("~/.config/recall/projects.json")
+    if not os.path.exists(config_path):
+        return
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+        for rule in config.get("rules", []):
+            PROJECT_RULES.append(
+                (re.compile(rule["pattern"], re.I), rule["name"])
+            )
+        PROJECT_COLORS.update(config.get("colors", {}))
+    except (json.JSONDecodeError, KeyError, OSError):
+        pass
+
+_load_project_config()
 
 FALLBACK_COLORS = [
     "#4488ff", "#aa77ff", "#ff8800", "#77cc33",
@@ -126,15 +106,6 @@ def derive_project(cwd: str) -> str:
     for pattern, name in PROJECT_RULES:
         if pattern.search(path):
             return name
-    if path in ("~/w", "~/w/"):
-        return "w"
-    if path in ("~/p", "~/p/"):
-        return "p"
-    if path in ("~/gt", "~/gt/"):
-        return "gt"
-    gt_match = re.match(r"~/gt/([^/]+)", path)
-    if gt_match:
-        return gt_match.group(1).replace("_", "-")[:16]
     parts = [p for p in path.rstrip("/").split("/") if p and p != "~"]
     if parts:
         return parts[-1][:16]
@@ -247,12 +218,25 @@ class SessionData:
 # ─────────────────────────────────────────────────────────────────────
 
 def get_connection():
+    """Connect to the Claude sessions database.
+
+    Configure via environment variables:
+        RECALL_DB_HOST (default: localhost)
+        RECALL_DB_PORT (default: 5433)
+        RECALL_DB_NAME (default: connectingservices)
+        RECALL_DB_USER (default: $USER)
+        RECALL_DB_PASSWORD (default: empty)
+    Or set RECALL_DATABASE_URL for a full connection string.
+    """
+    dsn = os.environ.get("RECALL_DATABASE_URL")
+    if dsn:
+        return psycopg2.connect(dsn)
     return psycopg2.connect(
-        host="localhost",
-        port=5433,
-        dbname="connectingservices",
-        user=os.environ.get("CS_DB_USER", os.environ.get("USER", "clayarnold")),
-        password=os.environ.get("CS_DB_PASSWORD", ""),
+        host=os.environ.get("RECALL_DB_HOST", "localhost"),
+        port=int(os.environ.get("RECALL_DB_PORT", "5433")),
+        dbname=os.environ.get("RECALL_DB_NAME", "connectingservices"),
+        user=os.environ.get("RECALL_DB_USER", os.environ.get("USER", "")),
+        password=os.environ.get("RECALL_DB_PASSWORD", ""),
     )
 
 
@@ -524,12 +508,18 @@ def search_embeddings(query_embedding: list[float], limit: int = 20) -> list[dic
 # ─────────────────────────────────────────────────────────────────────
 
 def _get_google_api_key() -> str:
+    """Get Google AI API key from GOOGLE_API_KEY env var or macOS Keychain.
+
+    For Keychain, set the service name via RECALL_KEYCHAIN_GOOGLE env var
+    (default: google-ai-api-key).
+    """
     key = os.environ.get("GOOGLE_API_KEY", "")
     if key:
         return key
+    keychain_service = os.environ.get("RECALL_KEYCHAIN_GOOGLE", "google-ai-api-key")
     try:
         key = subprocess.check_output(
-            ["security", "find-generic-password", "-s", "google-ai-api-key", "-w"],
+            ["security", "find-generic-password", "-s", keychain_service, "-w"],
             text=True,
         ).strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
