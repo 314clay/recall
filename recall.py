@@ -508,23 +508,46 @@ def search_embeddings(query_embedding: list[float], limit: int = 20) -> list[dic
 # ─────────────────────────────────────────────────────────────────────
 
 def _get_google_api_key() -> str:
-    """Get Google AI API key from GOOGLE_API_KEY env var or macOS Keychain.
+    """Get Google AI API key from RECALL_GOOGLE_API_KEY env var or macOS Keychain.
 
     For Keychain, set the service name via RECALL_KEYCHAIN_GOOGLE env var
     (default: google-ai-api-key).
+
+    Falls back to GOOGLE_API_KEY if RECALL_GOOGLE_API_KEY is not set.
     """
-    key = os.environ.get("GOOGLE_API_KEY", "")
-    if key:
-        return key
-    keychain_service = os.environ.get("RECALL_KEYCHAIN_GOOGLE", "google-ai-api-key")
-    try:
-        key = subprocess.check_output(
-            ["security", "find-generic-password", "-s", keychain_service, "-w"],
-            text=True,
-        ).strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
+    key = os.environ.get("RECALL_GOOGLE_API_KEY", "")
+    if not key:
+        keychain_service = os.environ.get("RECALL_KEYCHAIN_GOOGLE", "google-ai-api-key")
+        try:
+            key = subprocess.check_output(
+                ["security", "find-generic-password", "-s", keychain_service, "-w"],
+                text=True,
+            ).strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+    if not key:
+        key = os.environ.get("GOOGLE_API_KEY", "")
     return key
+
+
+def _get_genai_client():
+    """Create a google.genai Client with explicit API key to avoid env var conflicts."""
+    from google import genai
+
+    api_key = _get_google_api_key()
+    if not api_key:
+        return None
+    # Temporarily suppress GEMINI_API_KEY to avoid SDK warning about both being set
+    gemini_key = os.environ.pop("GEMINI_API_KEY", None)
+    google_key = os.environ.pop("GOOGLE_API_KEY", None)
+    try:
+        client = genai.Client(api_key=api_key)
+    finally:
+        if gemini_key is not None:
+            os.environ["GEMINI_API_KEY"] = gemini_key
+        if google_key is not None:
+            os.environ["GOOGLE_API_KEY"] = google_key
+    return client
 
 
 SUMMARY_PROMPT = """Analyze this Claude Code conversation and provide a structured summary.
@@ -548,7 +571,6 @@ TOPIC GUIDELINES:
 
 def generate_summary(session_id: str) -> dict | None:
     """Generate a summary for a session using Gemini Flash."""
-    from google import genai
 
     messages = fetch_session_messages(session_id)
     if not messages:
@@ -576,11 +598,10 @@ def generate_summary(session_id: str) -> dict | None:
 
     prompt = SUMMARY_PROMPT.format(conversation=conversation_text)
 
-    api_key = _get_google_api_key()
-    if not api_key:
+    client = _get_genai_client()
+    if not client:
         return None
 
-    client = genai.Client(api_key=api_key)
     resp = client.models.generate_content(
         model="gemini-2.5-flash",
         contents=prompt,
@@ -620,13 +641,10 @@ def generate_summary(session_id: str) -> dict | None:
 
 def embed_text(text: str) -> list[float] | None:
     """Embed text using Google text-embedding-004."""
-    from google import genai
-
-    api_key = _get_google_api_key()
-    if not api_key:
+    client = _get_genai_client()
+    if not client:
         return None
 
-    client = genai.Client(api_key=api_key)
     result = client.models.embed_content(
         model="text-embedding-004",
         contents=text,
@@ -1264,7 +1282,7 @@ class MessageScreen(Screen):
                 lines.append(f"[dim]{ts} {role}:[/] {content}\n")
 
         text = "\n".join(lines)
-        self.call_from_thread(self._set_content, text)
+        self.app.call_from_thread(self._set_content, text)
 
     def _set_content(self, text: str) -> None:
         try:
