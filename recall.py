@@ -522,6 +522,7 @@ def _get_google_api_key() -> str:
             key = subprocess.check_output(
                 ["security", "find-generic-password", "-s", keychain_service, "-w"],
                 text=True,
+                stderr=subprocess.DEVNULL,
             ).strip()
         except (subprocess.CalledProcessError, FileNotFoundError):
             pass
