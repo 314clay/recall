@@ -1,0 +1,745 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["psycopg2-binary", "google-genai"]
+# ///
+"""
+qrecall — Find similar prior questions and lazily load their knowledge.
+
+Commands:
+  qrecall "query"                      Search for similar prior sessions
+  qrecall show <session_id_prefix>     Lazy-load knowledge from a match
+  qrecall backfill                     Embed all sessions with summaries but no embeddings
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import subprocess
+import sys
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
+import psycopg2
+import psycopg2.extras
+
+# ─────────────────────────────────────────────────────────────────────
+# DB config
+# ─────────────────────────────────────────────────────────────────────
+
+DB_HOST = "localhost"
+DB_PORT = 5433
+DB_NAME = "connectingservices"
+DB_USER = os.environ.get("CS_DB_USER", os.environ.get("USER", "clayarnold"))
+DB_PASS = os.environ.get("CS_DB_PASSWORD", "")
+
+EMBEDDING_TABLE = "claude_sessions.session_embeddings_v2"
+EMBEDDING_DIM = 3072
+EMBEDDING_MODEL = "gemini-embedding-001"
+
+
+def get_conn():
+    return psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+        user=DB_USER, password=DB_PASS,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ANSI helpers
+# ─────────────────────────────────────────────────────────────────────
+
+def _is_tty():
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+CYAN = "\033[36m" if _is_tty() else ""
+YELLOW = "\033[33m" if _is_tty() else ""
+MAGENTA = "\033[35m" if _is_tty() else ""
+GREEN = "\033[32m" if _is_tty() else ""
+DIM = "\033[2m" if _is_tty() else ""
+BOLD = "\033[1m" if _is_tty() else ""
+RESET = "\033[0m" if _is_tty() else ""
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Data classes
+# ─────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ScoredResult:
+    session_id: str
+    score: float
+    question_preview: str
+    summary: str | None
+    project: str
+    date: datetime
+    topics: list[str]
+
+
+@dataclass
+class SessionKnowledge:
+    summary: str | None
+    user_requests: str | None
+    completed_work: str | None
+    topics: list[str]
+    first_answer: str
+    tool_counts: dict[str, int] | None = None
+    all_answers: list[str] | None = None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────
+
+def derive_project(cwd: str) -> str:
+    if not cwd:
+        return "?"
+    home = os.path.expanduser("~")
+    path = cwd.replace(home, "~")
+    parts = [p for p in path.rstrip("/").split("/") if p and p != "~"]
+    return parts[-1][:16] if parts else "?"
+
+
+def clean_preview(content: str, max_len: int = 100) -> str:
+    if not content:
+        return ""
+    text = content.strip()
+    # Strip XML-like tags
+    text = re.sub(r"<[^>]+>.*?</[^>]+>", " ", text, flags=re.S)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"^/\S+\s*", "", text.strip())
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_len:
+        text = text[:max_len - 1].rstrip() + "…"
+    return text
+
+
+def ensure_table(conn):
+    """Create session_embeddings_v2 table if it doesn't exist."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS claude_sessions.session_embeddings_v2 (
+                id SERIAL PRIMARY KEY,
+                session_id VARCHAR NOT NULL UNIQUE
+                    REFERENCES claude_sessions.sessions(session_id) ON DELETE CASCADE,
+                embedding vector(3072) NOT NULL,
+                content_hash TEXT,
+                model TEXT DEFAULT 'gemini-embedding-001',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+    conn.commit()
+
+
+def ensure_index(conn):
+    """No-op: 3072-dim vectors exceed pgvector's 2000-dim index limit.
+    Sequential scan is fast enough for <10K rows."""
+    pass
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Google AI embedding
+# ─────────────────────────────────────────────────────────────────────
+
+def _get_google_api_key() -> str:
+    """Get Google API key from env var or macOS Keychain."""
+    key = os.environ.get("GOOGLE_API_KEY", "")
+    if key:
+        return key
+    try:
+        key = subprocess.check_output(
+            ["security", "find-generic-password", "-s", "google-api-key", "-w"],
+            text=True,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    return key
+
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """Embed a batch of texts via Google AI gemini-embedding-001."""
+    api_key = _get_google_api_key()
+    if not api_key:
+        print(f"No Google API key found. Set GOOGLE_API_KEY or add 'google-api-key' to Keychain.")
+        sys.exit(1)
+
+    # Avoid noisy "Both GOOGLE_API_KEY and GEMINI_API_KEY are set" warning
+    os.environ.pop("GEMINI_API_KEY", None)
+    os.environ["GOOGLE_API_KEY"] = api_key
+    from google import genai
+
+    client = genai.Client(api_key=api_key)
+    results = []
+    for text in texts:
+        truncated = text[:10000]
+        result = client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=truncated,
+        )
+        results.append(result.embeddings[0].values)
+    return results
+
+
+def embed_text(text: str) -> list[float]:
+    return embed_texts([text])[0]
+
+
+def vec_str(embedding: list[float]) -> str:
+    return "[" + ",".join(str(f) for f in embedding) + "]"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Similarity strategies
+# ─────────────────────────────────────────────────────────────────────
+
+class SimilarityStrategy(ABC):
+    """Swappable similarity backend."""
+
+    @abstractmethod
+    def find_similar(self, query: str, limit: int, since_days: int | None) -> list[ScoredResult]:
+        ...
+
+
+class MultimodalEmbeddingStrategy(SimilarityStrategy):
+    """Vertex AI multimodalembedding@001 + pgvector cosine similarity."""
+
+    def find_similar(self, query: str, limit: int, since_days: int | None) -> list[ScoredResult]:
+        query_emb = embed_text(query)
+        conn = get_conn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                time_filter = ""
+                params: dict = {
+                    "vec": vec_str(query_emb),
+                    "limit": limit,
+                }
+                if since_days:
+                    time_filter = "AND s.start_time >= NOW() - INTERVAL '%(days)s days'"
+                    # Use string interpolation for interval since parameterized won't work
+                    time_filter = f"AND s.start_time >= NOW() - INTERVAL '{since_days} days'"
+
+                cur.execute(f"""
+                    SELECT
+                        se.session_id,
+                        1 - (se.embedding <=> %(vec)s::vector) AS similarity,
+                        ss.summary,
+                        ss.user_requests,
+                        ss.topics,
+                        s.cwd,
+                        s.start_time,
+                        fm.content AS first_message
+                    FROM {EMBEDDING_TABLE} se
+                    JOIN claude_sessions.sessions s ON se.session_id = s.session_id
+                    LEFT JOIN claude_sessions.session_summaries ss ON se.session_id = ss.session_id
+                    LEFT JOIN claude_sessions.first_messages fm ON se.session_id = fm.session_id
+                    WHERE s.parent_session_id IS NULL
+                    {time_filter}
+                    ORDER BY se.embedding <=> %(vec)s::vector
+                    LIMIT %(limit)s;
+                """, params)
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+
+        return [
+            ScoredResult(
+                session_id=r["session_id"],
+                score=float(r["similarity"]),
+                question_preview=clean_preview(r["first_message"] or ""),
+                summary=r["summary"],
+                project=derive_project(r["cwd"] or ""),
+                date=r["start_time"],
+                topics=_parse_topics(r["topics"]),
+            )
+            for r in rows
+        ]
+
+
+class FTSStrategy(SimilarityStrategy):
+    """PostgreSQL full-text search + token overlap scoring."""
+
+    def find_similar(self, query: str, limit: int, since_days: int | None) -> list[ScoredResult]:
+        conn = get_conn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                time_filter = ""
+                if since_days:
+                    time_filter = f"AND s.start_time >= NOW() - INTERVAL '{since_days} days'"
+
+                # Try ts_rank first, fall back to ILIKE
+                cur.execute(f"""
+                    SELECT
+                        s.session_id,
+                        ts_rank(
+                            to_tsvector('english', LEFT(COALESCE(fm.content, ''), 10000)),
+                            plainto_tsquery('english', %(query)s)
+                        ) AS rank,
+                        ss.summary,
+                        ss.user_requests,
+                        ss.topics,
+                        s.cwd,
+                        s.start_time,
+                        fm.content AS first_message
+                    FROM claude_sessions.sessions s
+                    LEFT JOIN claude_sessions.first_messages fm ON s.session_id = fm.session_id
+                    LEFT JOIN claude_sessions.session_summaries ss ON s.session_id = ss.session_id
+                    WHERE s.parent_session_id IS NULL
+                    AND LENGTH(COALESCE(fm.content, '')) < 15000
+                    AND (
+                        to_tsvector('english', LEFT(COALESCE(fm.content, ''), 10000))
+                            @@ plainto_tsquery('english', %(query)s)
+                        OR LOWER(COALESCE(fm.content, '')) LIKE '%%' || LOWER(%(query)s) || '%%'
+                        OR LOWER(COALESCE(ss.summary, '')) LIKE '%%' || LOWER(%(query)s) || '%%'
+                    )
+                    {time_filter}
+                    ORDER BY rank DESC
+                    LIMIT %(limit)s;
+                """, {"query": query, "limit": limit})
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+
+        # Application-level token overlap re-ranking
+        query_tokens = set(query.lower().split())
+        results = []
+        for r in rows:
+            text = (r["first_message"] or "") + " " + (r["summary"] or "")
+            text_tokens = set(text.lower().split())
+            overlap = len(query_tokens & text_tokens) / max(len(query_tokens), 1)
+            score = float(r["rank"]) + overlap * 0.5
+
+            results.append(ScoredResult(
+                session_id=r["session_id"],
+                score=score,
+                question_preview=clean_preview(r["first_message"] or ""),
+                summary=r["summary"],
+                project=derive_project(r["cwd"] or ""),
+                date=r["start_time"],
+                topics=_parse_topics(r["topics"]),
+            ))
+
+        results.sort(key=lambda x: x.score, reverse=True)
+        return results
+
+
+def _parse_topics(topics) -> list[str]:
+    if not topics:
+        return []
+    if isinstance(topics, list):
+        return topics
+    if isinstance(topics, str):
+        # Could be JSON array or comma-separated
+        topics = topics.strip()
+        if topics.startswith("["):
+            import json
+            try:
+                return json.loads(topics)
+            except Exception:
+                pass
+        return [t.strip() for t in topics.split(",") if t.strip()]
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Knowledge loader
+# ─────────────────────────────────────────────────────────────────────
+
+class KnowledgeLoader:
+    """Lazy loader — only fetches session content when explicitly requested."""
+
+    def resolve_session_id(self, prefix: str) -> str | None:
+        """Resolve a session ID prefix to a full session ID."""
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT session_id FROM claude_sessions.sessions
+                    WHERE session_id LIKE %s || '%%'
+                    ORDER BY start_time DESC LIMIT 1;
+                """, (prefix,))
+                row = cur.fetchone()
+                return row[0] if row else None
+        finally:
+            conn.close()
+
+    def load(self, session_id: str, full: bool = False, tools: bool = False) -> SessionKnowledge | None:
+        conn = get_conn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # Query 1: session_summaries
+                cur.execute("""
+                    SELECT summary, completed_work, user_requests, topics
+                    FROM claude_sessions.session_summaries
+                    WHERE session_id = %s;
+                """, (session_id,))
+                summary_row = cur.fetchone()
+
+                # Query 2: First assistant message
+                cur.execute("""
+                    SELECT content FROM claude_sessions.messages
+                    WHERE session_id = %s AND role = 'assistant'
+                    ORDER BY created_at ASC LIMIT 1;
+                """, (session_id,))
+                first_answer_row = cur.fetchone()
+                first_answer = ""
+                if first_answer_row:
+                    first_answer = first_answer_row["content"] or ""
+                    if not full:
+                        first_answer = first_answer[:2000]
+                        if len(first_answer) == 2000:
+                            first_answer += "\n…(truncated, use --full for complete)"
+
+                # Query 3: All assistant messages (if --full)
+                all_answers = None
+                if full:
+                    cur.execute("""
+                        SELECT content FROM claude_sessions.messages
+                        WHERE session_id = %s AND role = 'assistant'
+                        ORDER BY created_at ASC;
+                    """, (session_id,))
+                    all_answers = [r["content"] for r in cur.fetchall() if r["content"]]
+
+                # Query 4: Tool usages (if --tools)
+                tool_counts = None
+                if tools:
+                    cur.execute("""
+                        SELECT tu.tool_name, COUNT(*) as cnt
+                        FROM claude_sessions.tool_usages tu
+                        JOIN claude_sessions.messages m ON tu.message_id = m.id
+                        WHERE m.session_id = %s
+                        GROUP BY tu.tool_name
+                        ORDER BY cnt DESC;
+                    """, (session_id,))
+                    tool_counts = {r["tool_name"]: r["cnt"] for r in cur.fetchall()}
+
+        finally:
+            conn.close()
+
+        return SessionKnowledge(
+            summary=summary_row["summary"] if summary_row else None,
+            user_requests=summary_row["user_requests"] if summary_row else None,
+            completed_work=summary_row["completed_work"] if summary_row else None,
+            topics=_parse_topics(summary_row["topics"] if summary_row else None),
+            first_answer=first_answer,
+            tool_counts=tool_counts,
+            all_answers=all_answers,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Backfill
+# ─────────────────────────────────────────────────────────────────────
+
+def cmd_backfill(days: int | None = None):
+    """Embed all sessions with summaries but no v2 embeddings."""
+    conn = get_conn()
+    ensure_table(conn)
+
+    time_filter = ""
+    if days:
+        time_filter = f"AND s.start_time >= NOW() - INTERVAL '{days} days'"
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT ss.session_id, ss.summary, ss.user_requests
+            FROM claude_sessions.session_summaries ss
+            JOIN claude_sessions.sessions s ON ss.session_id = s.session_id
+            LEFT JOIN {EMBEDDING_TABLE} se ON ss.session_id = se.session_id
+            WHERE se.session_id IS NULL
+            AND ss.summary IS NOT NULL
+            {time_filter}
+            ORDER BY s.start_time DESC;
+        """)
+        to_embed = cur.fetchall()
+    conn.close()
+
+    if not to_embed:
+        print(f"{GREEN}All sessions already have v2 embeddings.{RESET}")
+        return
+
+    print(f"Found {BOLD}{len(to_embed)}{RESET} sessions to embed.")
+
+    batch_size = 50
+    total = len(to_embed)
+    embedded = 0
+
+    for i in range(0, total, batch_size):
+        batch = to_embed[i:i + batch_size]
+        texts = []
+        for row in batch:
+            text = (row["summary"] or "")
+            if row["user_requests"]:
+                text += "\n" + row["user_requests"]
+            texts.append(text)
+
+        try:
+            embeddings = embed_texts(texts)
+        except Exception as e:
+            print(f"\n{BOLD}Error embedding batch {i // batch_size + 1}: {e}{RESET}")
+            continue
+
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                for row, emb in zip(batch, embeddings):
+                    content_hash = hashlib.sha256(texts[batch.index(row)].encode()).hexdigest()[:16]
+                    cur.execute(f"""
+                        INSERT INTO {EMBEDDING_TABLE}
+                            (session_id, embedding, content_hash, model)
+                        VALUES (%(sid)s, %(emb)s::vector, %(hash)s, %(model)s)
+                        ON CONFLICT (session_id) DO UPDATE SET
+                            embedding = EXCLUDED.embedding,
+                            content_hash = EXCLUDED.content_hash;
+                    """, {
+                        "sid": row["session_id"],
+                        "emb": vec_str(emb),
+                        "hash": content_hash,
+                        "model": EMBEDDING_MODEL,
+                    })
+            conn.commit()
+        finally:
+            conn.close()
+
+        embedded += len(batch)
+        pct = embedded * 100 // total
+        bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+        print(f"\r  {bar} {embedded}/{total} ({pct}%)", end="", flush=True)
+
+    print(f"\n{GREEN}Done. Embedded {embedded} sessions.{RESET}")
+
+    # Create IVFFlat index if we now have enough rows
+    conn = get_conn()
+    try:
+        ensure_index(conn)
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Display
+# ─────────────────────────────────────────────────────────────────────
+
+def display_results(results: list[ScoredResult]):
+    if not results:
+        print(f"{DIM}No matching sessions found.{RESET}")
+        return
+
+    for i, r in enumerate(results):
+        # Score bar
+        bar_width = 10
+        filled = int(r.score * bar_width)
+        bar = "█" * filled + "░" * (bar_width - filled)
+
+        sid_short = r.session_id[:8]
+        date_str = r.date.strftime("%Y-%m-%d") if r.date else "?"
+        topics_str = " ".join(f"{MAGENTA}#{t}{RESET}" for t in r.topics[:3])
+
+        print(f"  {DIM}{bar}{RESET} {GREEN}{r.score:.3f}{RESET}  "
+              f"{CYAN}{sid_short}{RESET}  "
+              f"{DIM}{date_str}{RESET}  "
+              f"{YELLOW}{r.project}{RESET}")
+
+        if r.question_preview:
+            print(f"         {r.question_preview}")
+        if r.summary:
+            summary_short = r.summary[:120]
+            if len(r.summary) > 120:
+                summary_short += "…"
+            print(f"         {DIM}{summary_short}{RESET}")
+        if topics_str:
+            print(f"         {topics_str}")
+        print()
+
+
+def display_knowledge(session_id: str, knowledge: SessionKnowledge):
+    sid_short = session_id[:8]
+    print(f"\n{BOLD}Session {CYAN}{sid_short}{RESET}{BOLD}…{RESET}\n")
+
+    if knowledge.summary:
+        print(f"{BOLD}Summary:{RESET}")
+        print(f"  {knowledge.summary}\n")
+
+    if knowledge.user_requests:
+        print(f"{BOLD}User Requests:{RESET}")
+        for line in knowledge.user_requests.strip().split("\n"):
+            print(f"  {line}")
+        print()
+
+    if knowledge.completed_work:
+        print(f"{BOLD}Completed Work:{RESET}")
+        for line in knowledge.completed_work.strip().split("\n"):
+            print(f"  {line}")
+        print()
+
+    if knowledge.topics:
+        topics_str = " ".join(f"{MAGENTA}#{t}{RESET}" for t in knowledge.topics)
+        print(f"{BOLD}Topics:{RESET} {topics_str}\n")
+
+    if knowledge.first_answer:
+        print(f"{BOLD}First Answer:{RESET}")
+        print(f"  {knowledge.first_answer[:3000]}\n")
+
+    if knowledge.all_answers:
+        print(f"{BOLD}All Answers ({len(knowledge.all_answers)} messages):{RESET}")
+        for i, ans in enumerate(knowledge.all_answers):
+            print(f"\n  {DIM}--- message {i + 1} ---{RESET}")
+            print(f"  {ans[:5000]}")
+        print()
+
+    if knowledge.tool_counts:
+        print(f"{BOLD}Tool Usage:{RESET}")
+        for tool, count in knowledge.tool_counts.items():
+            print(f"  {YELLOW}{tool}{RESET}: {count}")
+        print()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────
+
+def parse_since(value: str) -> int | None:
+    """Parse --since value like '30d', '7d', '2w'."""
+    if not value:
+        return None
+    m = re.match(r"^(\d+)([dwm])$", value.lower())
+    if not m:
+        print(f"Invalid --since format: {value} (use e.g. 30d, 2w, 3m)")
+        sys.exit(1)
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit == "d":
+        return n
+    elif unit == "w":
+        return n * 7
+    elif unit == "m":
+        return n * 30
+    return None
+
+
+def _parse_bare_search():
+    """Parse args when no subcommand is given (bare query mode)."""
+    all_args = sys.argv[1:]
+    query_parts = []
+    limit = 10
+    since = None
+    strategy = "embedding"
+
+    i = 0
+    while i < len(all_args):
+        if all_args[i] == "--limit" and i + 1 < len(all_args):
+            limit = int(all_args[i + 1])
+            i += 2
+        elif all_args[i] == "--since" and i + 1 < len(all_args):
+            since = all_args[i + 1]
+            i += 2
+        elif all_args[i] == "--strategy" and i + 1 < len(all_args):
+            strategy = all_args[i + 1]
+            i += 2
+        elif all_args[i] in ("-h", "--help"):
+            return None  # Let argparse handle it
+        elif all_args[i].startswith("-"):
+            print(f"Unknown option: {all_args[i]}")
+            sys.exit(1)
+        else:
+            query_parts.append(all_args[i])
+            i += 1
+
+    if not query_parts:
+        return None
+
+    query = " ".join(query_parts)
+    since_days = parse_since(since) if since else None
+
+    if strategy == "fts":
+        strat = FTSStrategy()
+    else:
+        strat = MultimodalEmbeddingStrategy()
+
+    results = strat.find_similar(query, limit, since_days)
+    display_results(results)
+    return True
+
+
+SUBCOMMANDS = {"search", "show", "backfill"}
+
+
+def main():
+    # Detect if the first positional arg is a known subcommand
+    # If not, treat everything as a bare search query
+    first_positional = None
+    for arg in sys.argv[1:]:
+        if not arg.startswith("-"):
+            first_positional = arg
+            break
+
+    if first_positional not in SUBCOMMANDS:
+        result = _parse_bare_search()
+        if result:
+            return
+        # Fall through to argparse for --help etc.
+
+    parser = argparse.ArgumentParser(
+        description="Find similar prior Claude Code sessions",
+        usage="qrecall [options] <query> | qrecall show <id> | qrecall backfill",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # Search (default)
+    search_parser = sub.add_parser("search", help="Search for similar sessions")
+    search_parser.add_argument("query", nargs="+", help="Search query")
+    search_parser.add_argument("--limit", type=int, default=10)
+    search_parser.add_argument("--since", type=str, default=None)
+    search_parser.add_argument("--strategy", choices=["embedding", "fts"], default="embedding")
+
+    # Show
+    show_parser = sub.add_parser("show", help="Show session knowledge")
+    show_parser.add_argument("session_id", help="Session ID or prefix")
+    show_parser.add_argument("--full", action="store_true", help="Full assistant messages")
+    show_parser.add_argument("--tools", action="store_true", help="Tool usage details")
+
+    # Backfill
+    backfill_parser = sub.add_parser("backfill", help="Embed sessions missing v2 embeddings")
+    backfill_parser.add_argument("--days", type=int, default=None)
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        sys.exit(1)
+
+    if args.command == "search":
+        query = " ".join(args.query)
+        since_days = parse_since(args.since) if args.since else None
+
+        if args.strategy == "fts":
+            strat = FTSStrategy()
+        else:
+            strat = MultimodalEmbeddingStrategy()
+
+        results = strat.find_similar(query, args.limit, since_days)
+        display_results(results)
+
+    elif args.command == "show":
+        loader = KnowledgeLoader()
+        full_id = loader.resolve_session_id(args.session_id)
+        if not full_id:
+            print(f"No session found matching prefix: {args.session_id}")
+            sys.exit(1)
+
+        knowledge = loader.load(full_id, full=args.full, tools=args.tools)
+        if not knowledge:
+            print(f"No data found for session: {full_id[:8]}…")
+            sys.exit(1)
+
+        display_knowledge(full_id, knowledge)
+
+    elif args.command == "backfill":
+        cmd_backfill(args.days)
+
+
+if __name__ == "__main__":
+    main()
